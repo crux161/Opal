@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"opal/internal/omiai"
+	"opal/internal/social"
 	"opal/internal/store"
 )
 
@@ -46,10 +47,14 @@ type Config struct {
 }
 
 type chatMessage struct {
+	ID          string
 	FromSelf    bool
 	DisplayName string
 	Body        string
 	SentAt      time.Time
+	Receipt     string
+	Secure      bool
+	Intro       bool
 }
 
 type connectResultMsg struct {
@@ -68,7 +73,46 @@ type sendResultMsg struct {
 	Err  error
 }
 
+type relationshipsResultMsg struct {
+	Friends []omiai.Friend
+	Pending []omiai.PendingFriendRequest
+	Err     error
+}
+
+type messageDispatchMsg struct {
+	Kind         string
+	PeerID       string
+	MessageID    string
+	FriendshipID string
+	Err          error
+}
+
+type friendMutationMsg struct {
+	Kind         string
+	PeerID       string
+	FriendshipID string
+	Err          error
+}
+
 type tickMsg time.Time
+
+type dialogKind string
+
+const (
+	dialogKindFriendRequest dialogKind = "friend_request"
+	dialogKindFriendIntro   dialogKind = "friend_intro"
+)
+
+type contactDialog struct {
+	Kind         dialogKind
+	PeerID       string
+	DisplayName  string
+	Message      string
+	PublicKey    string
+	FriendshipID string
+	MessageID    string
+	Ciphertext   string
+}
 
 type model struct {
 	cfg Config
@@ -94,13 +138,22 @@ type model struct {
 	peerListFocused bool
 	peers           []omiai.Peer
 	selected        int
+	dialing         bool
 
-	composer textinput.Model
-	viewport viewport.Model
+	dialInput textinput.Model
+	composer  textinput.Model
+	viewport  viewport.Model
 
 	conversations map[string][]chatMessage
 	unread        map[string]int
 	typingUntil   map[string]time.Time
+
+	trust           social.TrustState
+	friends         map[string]omiai.Friend
+	pendingIncoming map[string]omiai.PendingFriendRequest
+	pendingOutgoing map[string]bool
+	activeDialog    *contactDialog
+	dialogQueue     []contactDialog
 
 	typingActive bool
 	typingPeerID string
@@ -126,6 +179,7 @@ type styles struct {
 	statusBar      lipgloss.Style
 	peerSelected   lipgloss.Style
 	peerUnselected lipgloss.Style
+	modal          lipgloss.Style
 }
 
 func NewModel(cfg Config) tea.Model {
@@ -148,22 +202,35 @@ func NewModel(cfg Config) tea.Model {
 	composer.Prompt = "> "
 	composer.CharLimit = 512
 	composer.Width = 64
+	dialInput := newInput("peer quicdial code", false)
+	dialInput.Prompt = "dial> "
+	dialInput.CharLimit = 256
 
 	m := model{
-		cfg:           cfg,
-		screen:        screenAuth,
-		authMode:      authModeLogin,
-		loginInputs:   loginInputs,
-		signupInputs:  signupInputs,
-		directInputs:  directInputs,
-		composer:      composer,
-		viewport:      viewport.New(0, 0),
-		conversations: make(map[string][]chatMessage),
-		unread:        make(map[string]int),
-		typingUntil:   make(map[string]time.Time),
-		styles:        defaultStyles(),
+		cfg:             cfg,
+		screen:          screenAuth,
+		authMode:        authModeLogin,
+		loginInputs:     loginInputs,
+		signupInputs:    signupInputs,
+		directInputs:    directInputs,
+		dialInput:       dialInput,
+		composer:        composer,
+		viewport:        viewport.New(0, 0),
+		conversations:   make(map[string][]chatMessage),
+		unread:          make(map[string]int),
+		typingUntil:     make(map[string]time.Time),
+		friends:         make(map[string]omiai.Friend),
+		pendingIncoming: make(map[string]omiai.PendingFriendRequest),
+		pendingOutgoing: make(map[string]bool),
+		styles:          defaultStyles(),
 	}
 	m.setComposerFocus(false)
+	m.dialInput.Blur()
+	if trustState, err := cfg.Store.EnsureTrustState(); err == nil {
+		m.trust = trustState
+	} else {
+		m.errorText = err.Error()
+	}
 
 	if cfg.InitialSession.User.QuicdialID != "" {
 		m.screen = screenLoading
@@ -218,8 +285,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err := m.cfg.Store.Save(m.session); err != nil {
 				m.status = fmt.Sprintf("Connected, but failed to save session: %v", err)
 			}
+			cmds = append(cmds, syncRelationshipsCmd(m.cfg, m.session))
 		}
 		cmds = append(cmds, waitForSocketEvent(m.events))
+	case relationshipsResultMsg:
+		if msg.Err != nil {
+			m.errorText = msg.Err.Error()
+			break
+		}
+		m.applyRelationships(msg.Friends, msg.Pending)
 	case socketEventMsg:
 		if m.screen != screenChat {
 			break
@@ -235,7 +309,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case omiai.PeersEvent:
 			m.applyPeers(event.Peers)
 		case omiai.RelayEvent:
-			m.applyRelay(event.Message)
+			if cmd := m.applyRelay(event.Message); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		case omiai.PushEvent:
+			if cmd := m.handlePushEvent(event); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		case omiai.ErrorEvent:
 			m.client = nil
 			m.events = nil
@@ -258,6 +338,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Typing update failed"
 			}
 		}
+	case messageDispatchMsg:
+		if m.screen != screenChat {
+			break
+		}
+		if msg.Err != nil {
+			m.updateMessageReceipt(msg.PeerID, msg.MessageID, "failed")
+			m.errorText = msg.Err.Error()
+			break
+		}
+		if msg.Kind == "intro" && m.session.Token != "" && !m.isFriend(msg.PeerID) {
+			m.pendingOutgoing[msg.PeerID] = true
+		}
+	case friendMutationMsg:
+		if msg.Err != nil {
+			m.errorText = msg.Err.Error()
+			break
+		}
+		switch msg.Kind {
+		case "friend_request":
+			m.pendingOutgoing[msg.PeerID] = true
+			m.status = fmt.Sprintf("Friend request sent to %s", msg.PeerID)
+		case "friend_accept":
+			m.status = fmt.Sprintf("Friend request accepted for %s", msg.PeerID)
+		case "friend_decline":
+			m.status = fmt.Sprintf("Friend request declined for %s", msg.PeerID)
+		case "friend_remove":
+			delete(m.friends, msg.PeerID)
+			delete(m.pendingIncoming, msg.PeerID)
+			delete(m.pendingOutgoing, msg.PeerID)
+			_ = m.forgetPeer(msg.PeerID)
+			m.status = fmt.Sprintf("Removed %s from friends", msg.PeerID)
+		}
+		if m.session.Token != "" {
+			cmds = append(cmds, syncRelationshipsCmd(m.cfg, m.session))
+		}
+	case dialResultMsg:
+		m.closeDialPrompt()
+		m.applyDialResult(msg.Code, msg.Result, msg.Err)
 	case tea.KeyMsg:
 		switch m.screen {
 		case screenAuth, screenLoading:
@@ -325,6 +443,41 @@ func (m *model) updateAuth(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *model) updateChat(msg tea.KeyMsg) tea.Cmd {
+	if m.activeDialog != nil {
+		switch msg.String() {
+		case "y", "a", "enter":
+			return m.acceptActiveDialog()
+		case "n", "d", "esc":
+			return m.rejectActiveDialog()
+		case "ctrl+c", "q":
+			if m.client != nil {
+				_ = m.client.Close()
+			}
+			return tea.Quit
+		default:
+			return nil
+		}
+	}
+
+	if m.dialing {
+		switch msg.String() {
+		case "esc":
+			m.closeDialPrompt()
+			return nil
+		case "enter":
+			return m.submitDial()
+		case "ctrl+c", "q":
+			if m.client != nil {
+				_ = m.client.Close()
+			}
+			return tea.Quit
+		}
+
+		var cmd tea.Cmd
+		m.dialInput, cmd = m.dialInput.Update(msg)
+		return cmd
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "q":
 		if m.client != nil {
@@ -340,6 +493,17 @@ func (m *model) updateChat(msg tea.KeyMsg) tea.Cmd {
 			m.errorText = ""
 			return connectSessionCmd(m.cfg, m.session)
 		}
+	case "f":
+		if peerID := m.currentPeerID(); peerID != "" && !m.isFriend(peerID) && !m.pendingOutgoing[peerID] {
+			return sendFriendRequestCmd(m.cfg, m.session, peerID)
+		}
+	case "u":
+		if peerID := m.currentPeerID(); peerID != "" && m.isFriend(peerID) {
+			return removeFriendCmd(m.cfg, m.session, peerID)
+		}
+	case "d":
+		m.openDialPrompt()
+		return nil
 	case "tab":
 		m.setComposerFocus(m.peerListFocused)
 		return nil
@@ -512,6 +676,11 @@ func (m *model) logout() tea.Cmd {
 	m.conversations = make(map[string][]chatMessage)
 	m.unread = make(map[string]int)
 	m.typingUntil = make(map[string]time.Time)
+	m.friends = make(map[string]omiai.Friend)
+	m.pendingIncoming = make(map[string]omiai.PendingFriendRequest)
+	m.pendingOutgoing = make(map[string]bool)
+	m.activeDialog = nil
+	m.dialogQueue = nil
 	m.typingActive = false
 	m.typingPeerID = ""
 	m.composer.SetValue("")
@@ -557,17 +726,45 @@ func (m *model) sendCurrentMessage() tea.Cmd {
 	}
 
 	displayName := m.displayNameForSelf()
-	m.appendMessage(peerID, chatMessage{
+	messageID := social.RandomID()
+	entry := chatMessage{
+		ID:          messageID,
 		FromSelf:    true,
 		DisplayName: displayName,
 		Body:        body,
 		SentAt:      time.Now(),
+		Receipt:     "sent",
+	}
+
+	var sendCmd tea.Cmd
+	if trustedKey := m.trustedPublicKey(peerID); trustedKey != "" {
+		ciphertext, err := social.Encrypt(m.trust.Identity, trustedKey, body)
+		if err != nil {
+			m.errorText = err.Error()
+			return nil
+		}
+		entry.Secure = true
+		sendCmd = sendSecureMessageCmd(m.client, m.session, peerID, ciphertext, m.trust.Identity.PublicKey, messageID)
+	} else {
+		entry.Intro = true
+		entry.Receipt = "awaiting trust"
+		sendCmd = sendIntroMessageCmd(m.cfg, m.client, m.session, peerID, body, m.trust.Identity.PublicKey, messageID)
+	}
+
+	m.appendMessage(peerID, chatMessage{
+		ID:          entry.ID,
+		FromSelf:    entry.FromSelf,
+		DisplayName: entry.DisplayName,
+		Body:        entry.Body,
+		SentAt:      entry.SentAt,
+		Receipt:     entry.Receipt,
+		Secure:      entry.Secure,
+		Intro:       entry.Intro,
 	})
 	m.composer.SetValue("")
 
-	chatCmd := sendChatCmd(m.client, peerID, body, displayName)
 	stopCmd := m.stopTyping()
-	return tea.Batch(chatCmd, stopCmd)
+	return tea.Batch(sendCmd, stopCmd)
 }
 
 func (m *model) handleComposerChange() tea.Cmd {
@@ -663,10 +860,10 @@ func (m *model) applyPeers(peers []omiai.Peer) {
 	m.rebuildViewport()
 }
 
-func (m *model) applyRelay(message omiai.RelayMessage) {
+func (m *model) applyRelay(message omiai.RelayMessage) tea.Cmd {
 	peerID := strings.TrimSpace(message.FromQuicdialID)
 	if peerID == "" {
-		return
+		return nil
 	}
 
 	m.ensurePeer(peerID, message.DisplayName)
@@ -678,33 +875,106 @@ func (m *model) applyRelay(message omiai.RelayMessage) {
 		} else {
 			delete(m.typingUntil, peerID)
 		}
+		return nil
 	case "chat":
 		when := time.Now()
 		if message.SentAt > 0 {
 			when = time.UnixMilli(message.SentAt)
 		}
 		m.appendMessage(peerID, chatMessage{
+			ID:          message.MessageID,
 			FromSelf:    false,
 			DisplayName: message.DisplayName,
 			Body:        message.Body,
 			SentAt:      when,
+			Receipt:     "read",
 		})
 		if peerID != m.currentPeerID() {
 			m.unread[peerID]++
 		}
 		delete(m.typingUntil, peerID)
+		return nil
+	case "friend_intro":
+		m.queueDialog(contactDialog{
+			Kind:         dialogKindFriendIntro,
+			PeerID:       peerID,
+			DisplayName:  fallback(message.DisplayName, peerID),
+			Message:      message.Body,
+			PublicKey:    message.PublicFriendKey,
+			FriendshipID: fallback(message.FriendshipID, m.pendingIncoming[peerID].FriendshipID),
+			MessageID:    message.MessageID,
+		})
+		m.status = fmt.Sprintf("First contact from %s is waiting for your decision", fallback(message.DisplayName, peerID))
+		return nil
+	case "secure_chat":
+		publicKey := message.PublicFriendKey
+		if trustedKey := m.trustedPublicKey(peerID); trustedKey != "" {
+			publicKey = trustedKey
+		}
+		if trustedKey := m.trustedPublicKey(peerID); trustedKey == "" {
+			m.queueDialog(contactDialog{
+				Kind:         dialogKindFriendIntro,
+				PeerID:       peerID,
+				DisplayName:  fallback(message.DisplayName, peerID),
+				PublicKey:    message.PublicFriendKey,
+				MessageID:    message.MessageID,
+				Ciphertext:   message.Ciphertext,
+				FriendshipID: m.pendingIncoming[peerID].FriendshipID,
+			})
+			m.status = fmt.Sprintf("%s sent an encrypted contact message", fallback(message.DisplayName, peerID))
+			return nil
+		}
+		body, err := social.Decrypt(m.trust.Identity, publicKey, message.Ciphertext)
+		if err != nil {
+			m.errorText = err.Error()
+			return nil
+		}
+		when := time.Now()
+		if message.SentAt > 0 {
+			when = time.UnixMilli(message.SentAt)
+		}
+		m.appendMessage(peerID, chatMessage{
+			ID:          message.MessageID,
+			FromSelf:    false,
+			DisplayName: fallback(message.DisplayName, peerID),
+			Body:        body,
+			SentAt:      when,
+			Receipt:     "read",
+			Secure:      true,
+		})
+		if peerID != m.currentPeerID() {
+			m.unread[peerID]++
+		}
+		delete(m.typingUntil, peerID)
+		return sendReceiptCmd(m.client, m.session, peerID, message.MessageID)
+	case "friend_ack":
+		if message.Status == "accepted" {
+			if err := m.trustPeer(peerID, message.PublicFriendKey); err != nil {
+				m.errorText = err.Error()
+			}
+			m.updateMessageReceipt(peerID, message.ReceiptMessageID, "read")
+			m.status = fmt.Sprintf("%s trusted your friend key", fallback(message.DisplayName, peerID))
+		} else {
+			m.updateMessageReceipt(peerID, message.ReceiptMessageID, "rejected")
+			m.status = fmt.Sprintf("%s rejected first contact", fallback(message.DisplayName, peerID))
+		}
+		return nil
+	case "receipt":
+		m.updateMessageReceipt(peerID, message.ReceiptMessageID, "read")
+		return nil
 	default:
+		return nil
 	}
 }
 
-func (m *model) ensurePeer(peerID, name string) {
+func (m *model) ensurePeer(peerID, name string) *omiai.Peer {
 	for i := range m.peers {
 		if m.peers[i].QuicdialID == peerID {
 			if name != "" {
 				m.peers[i].DisplayName = name
 			}
 			m.peers[i].Online = true
-			return
+			return &m.peers[i]
 		}
 	}
 
@@ -718,6 +988,12 @@ func (m *model) ensurePeer(peerID, name string) {
 	if len(m.peers) == 1 {
 		m.selected = 0
 	}
+	for i := range m.peers {
+		if m.peers[i].QuicdialID == peerID {
+			return &m.peers[i]
+		}
+	}
+	return nil
 }
 
 func (m *model) appendMessage(peerID string, message chatMessage) {
@@ -758,7 +1034,17 @@ func (m *model) rebuildViewport() {
 		if message.FromSelf {
 			label = "You"
 		}
-		meta := m.styles.muted.Render(fmt.Sprintf("%s  %s", label, message.SentAt.Format("15:04")))
+		metaParts := []string{label, message.SentAt.Format("15:04")}
+		if message.Secure {
+			metaParts = append(metaParts, "secure")
+		}
+		if message.Intro {
+			metaParts = append(metaParts, "intro")
+		}
+		if message.FromSelf && message.Receipt != "" {
+			metaParts = append(metaParts, message.Receipt)
+		}
+		meta := m.styles.muted.Render(strings.Join(metaParts, "  "))
 		bubble := m.styles.peerBubble
 		if message.FromSelf {
 			bubble = m.styles.selfBubble
@@ -837,8 +1123,15 @@ func (m *model) chatView() string {
 	body := m.renderBody()
 	typing := m.renderTypingLine()
 	input := m.renderInput()
-	footer := m.styles.subtle.Render("tab focus | enter send/select | ctrl+l logout | r reconnect | q quit")
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, typing, input, footer)
+	footer := m.styles.subtle.Render("tab focus | d dial code | enter send/select | f add friend | u remove friend | ctrl+l logout | r reconnect | q quit")
+	base := lipgloss.JoinVertical(lipgloss.Left, header, body, typing, input, footer)
+	if m.activeDialog != nil {
+		return lipgloss.JoinVertical(lipgloss.Left, base, "", m.renderDialog())
+	}
+	if m.dialing {
+		return lipgloss.JoinVertical(lipgloss.Left, base, "", m.renderDialPrompt())
+	}
+	return base
 }
 
 func (m *model) renderHeader() string {
@@ -853,6 +1146,7 @@ func (m *model) renderHeader() string {
 		lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Top, title, "  ", identity),
 		status,
+		m.styles.subtle.Render(m.selectedPeerSummary()),
 	)
 }
 
@@ -874,21 +1168,17 @@ func (m *model) renderPeerList(width int) string {
 
 	lines := make([]string, 0, len(m.peers))
 	for i, peer := range m.peers {
-		name := displayName(peer)
-		status := "online"
-		if !peer.Online {
-			status = "offline"
-		}
-		line := fmt.Sprintf("%s  [%s]", name, status)
+		line := fmt.Sprintf("%s  %s", displayName(peer), m.peerTags(peer))
 		if unread := m.unread[peer.QuicdialID]; unread > 0 {
 			line = fmt.Sprintf("%s  (%d new)", line, unread)
 		}
+		subline := m.styles.muted.Render(peer.QuicdialID)
 
 		style := m.styles.peerUnselected
 		if i == m.selected {
 			style = m.styles.peerSelected
 		}
-		lines = append(lines, style.Width(width).Render(line))
+		lines = append(lines, style.Width(width).Render(line+"\n"+subline))
 	}
 
 	title := m.styles.muted.Render("Peers")
@@ -912,7 +1202,7 @@ func (m *model) renderTypingLine() string {
 		return m.styles.error.Render(m.errorText)
 	}
 
-	return m.styles.subtle.Render(fmt.Sprintf("Chatting with %s", m.currentPeerName()))
+	return m.styles.subtle.Render(fmt.Sprintf("Chatting with %s | %s", m.currentPeerName(), m.currentPeerStatus()))
 }
 
 func (m *model) renderInput() string {
@@ -924,6 +1214,8 @@ func (m *model) renderInput() string {
 	body := m.composer.View()
 	if m.currentPeerID() == "" {
 		body = m.styles.subtle.Render("No peer selected.")
+	} else if !m.isTrusted(m.currentPeerID()) {
+		body = body + "\n" + m.styles.subtle.Render("First send shares your public friend key and waits for receiver approval.")
 	}
 
 	return m.styles.inputPanel.Width(maxInt(28, m.width-2)).Render(
@@ -1130,6 +1422,7 @@ func defaultStyles() styles {
 		statusBar:      lipgloss.NewStyle().Foreground(lipgloss.Color("#0f1419")).Background(lipgloss.Color("#9fd356")).Padding(0, 1),
 		peerSelected:   lipgloss.NewStyle().Foreground(lipgloss.Color("#0f1419")).Background(lipgloss.Color("#9fd356")).Padding(0, 1),
 		peerUnselected: lipgloss.NewStyle().Foreground(lipgloss.Color("#f5efe6")).Padding(0, 1),
+		modal:          lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(lipgloss.Color("#f7b267")).Background(lipgloss.Color("#16202a")).Padding(1, 2),
 	}
 }
 

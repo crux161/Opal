@@ -83,19 +83,25 @@ func (c *SocketClient) Events() <-chan SocketEvent {
 }
 
 func (c *SocketClient) SendChat(ctx context.Context, toPeerID, body, displayName string) error {
-	return c.pushRelay(ctx, RelayMessage{
-		Kind:        "chat",
-		Body:        body,
-		DisplayName: displayName,
-	}, toPeerID)
+	return c.SendRelay(ctx, RelayMessage{
+		Kind:         "chat",
+		Body:         body,
+		DisplayName:  displayName,
+		ToQuicdialID: toPeerID,
+	})
 }
 
 func (c *SocketClient) SendTyping(ctx context.Context, toPeerID, displayName string, typing bool) error {
-	return c.pushRelay(ctx, RelayMessage{
-		Kind:        "typing",
-		Typing:      typing,
-		DisplayName: displayName,
-	}, toPeerID)
+	return c.SendRelay(ctx, RelayMessage{
+		Kind:         "typing",
+		Typing:       typing,
+		DisplayName:  displayName,
+		ToQuicdialID: toPeerID,
+	})
+}
+
+func (c *SocketClient) SendRelay(ctx context.Context, message RelayMessage) error {
+	return c.pushRelay(ctx, message, message.ToQuicdialID)
 }
 
 func (c *SocketClient) RefreshPeers(ctx context.Context) error {
@@ -117,6 +123,29 @@ func (c *SocketClient) RefreshPeers(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *SocketClient) ResolveQuicdial(ctx context.Context, code string) (ResolveResult, error) {
+	response, err := c.phoenix.Push(ctx, peerTopicPrefix+c.peerID, "resolve_quicdial", map[string]any{
+		"code": strings.TrimSpace(code),
+	})
+	if err != nil {
+		return ResolveResult{}, err
+	}
+
+	var payload struct {
+		IP         string           `json:"ip"`
+		ICEServers []map[string]any `json:"ice_servers"`
+	}
+	if err := decodeReply(response, &payload); err != nil {
+		return ResolveResult{}, err
+	}
+
+	return ResolveResult{
+		PeerID:     strings.TrimSpace(code),
+		IP:         payload.IP,
+		ICEServers: payload.ICEServers,
+	}, nil
 }
 
 func (c *SocketClient) Close() error {
@@ -146,6 +175,13 @@ func (c *SocketClient) dispatch() {
 		case "phx_error", "phx_close":
 			c.emit(ErrorEvent{Err: fmt.Errorf("phoenix %s on %s", frame.Event, frame.Topic)})
 			return
+		case "friend_request_received", "friend_accepted", "friend_declined", "friend_removed":
+			var payload map[string]any
+			if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+				c.emit(ErrorEvent{Err: err})
+				return
+			}
+			c.emit(PushEvent{Event: frame.Event, Payload: payload})
 		}
 	}
 

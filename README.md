@@ -12,8 +12,12 @@ This workspace now provides:
 
 - login, signup, and direct-connect flows
 - live peer list via `lobby:sankaku`
+- manual quicdial dialing via Omiai's `resolve_quicdial`
 - per-peer chat over `relay_message`
 - typing indicators relayed through the same signaling channel
+- Omiai friend list and pending request sync
+- first-contact accept/reject dialogs for non-friends
+- local friend-key persistence plus encrypted follow-up chat and read receipts after trust is established
 - saved JWT session reuse between launches
 
 Messages are intentionally server-relayed and ephemeral. This is a basic chat peer, not a durable inbox.
@@ -56,6 +60,10 @@ go run ./cmd/opal --api-url http://localhost:8000 --signal-url ws://localhost:40
 - `tab`: move between auth fields or switch chat focus
 - `enter`: submit auth, select compose, or send a message
 - `up/down`: move through peers
+- `d`: open the quicdial dial prompt
+- `f`: send a friend request to the selected peer
+- `u`: remove the selected friend
+- `y` / `n`: accept or reject the active first-contact dialog
 - `ctrl+l`: logout and clear the saved JWT session
 - `r`: reconnect after a disconnect
 - `q`: quit
@@ -64,3 +72,5 @@ go run ./cmd/opal --api-url http://localhost:8000 --signal-url ws://localhost:40
 
 - Direct mode skips `omiai-api` and authenticates with only a `quicdial_id`, which is useful for local signaling-only testing.
 - The websocket client follows the same Phoenix frame shape Gem already uses in `pkg/webrtc_shim`; this keeps Opal aligned with the existing Omiai signaling contract instead of inventing another one.
+- The first message to a non-trusted peer is sent as a friend intro with the sender's public friend key. Once the receiver accepts, both peers can exchange encrypted follow-up messages without another key roundtrip.
+- The dial prompt resolves a quicdial code through Omiai's `resolve_quicdial` event, then injects or focuses that peer in the list so you can message or friend-request them even if they were not already visible in lobby presence.
