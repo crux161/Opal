@@ -32,7 +32,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	serverHost := omiai.ServerHostFromEndpoint(cfg.SignalingURL)
+	if initialSession.ServerHost != "" {
+		serverHost = initialSession.ServerHost
+		cfg.APIURL, cfg.SignalingURL = omiai.EndpointsForServerHost(serverHost)
+	}
+
 	cfg.Store = sessionStore
+	cfg.ServerHost = serverHost
 	cfg.API = omiai.NewAPIClient(cfg.APIURL)
 	cfg.InitialSession = initialSession
 

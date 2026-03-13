@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -20,8 +21,9 @@ func TestStoreSaveLoad(t *testing.T) {
 	}
 
 	input := omiai.Session{
-		Token:    "token-123",
-		DeviceID: "device-123",
+		Token:      "token-123",
+		DeviceID:   "device-123",
+		ServerHost: omiai.DefaultServerHost,
 		User: omiai.User{
 			QuicdialID:  "alice",
 			DisplayName: "Alice",
@@ -41,6 +43,14 @@ func TestStoreSaveLoad(t *testing.T) {
 
 	if !reflect.DeepEqual(output, input) {
 		t.Fatalf("loaded session mismatch:\n got: %#v\nwant: %#v", output, input)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved session: %v", err)
+	}
+	if strings.Contains(string(raw), input.Token) {
+		t.Fatalf("session file should not contain the token in plaintext")
 	}
 }
 

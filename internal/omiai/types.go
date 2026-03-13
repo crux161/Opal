@@ -10,10 +10,11 @@ type User struct {
 }
 
 type Session struct {
-	Token    string `json:"token,omitempty"`
-	DeviceID string `json:"device_id"`
-	Direct   bool   `json:"direct,omitempty"`
-	User     User   `json:"user"`
+	Token      string `json:"token,omitempty"`
+	DeviceID   string `json:"device_id"`
+	Direct     bool   `json:"direct,omitempty"`
+	ServerHost string `json:"server_host,omitempty"`
+	User       User   `json:"user"`
 }
 
 type SignupRequest struct {

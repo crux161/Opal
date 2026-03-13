@@ -42,6 +42,7 @@ type Config struct {
 	API            *omiai.APIClient
 	APIURL         string
 	SignalingURL   string
+	ServerHost     string
 	Store          *store.Store
 	InitialSession omiai.Session
 }
@@ -134,6 +135,7 @@ type model struct {
 	loginInputs  []textinput.Model
 	signupInputs []textinput.Model
 	directInputs []textinput.Model
+	serverInput  textinput.Model
 
 	peerListFocused bool
 	peers           []omiai.Peer
@@ -205,6 +207,10 @@ func NewModel(cfg Config) tea.Model {
 	dialInput := newInput("peer quicdial code", false)
 	dialInput.Prompt = "dial> "
 	dialInput.CharLimit = 256
+	serverInput := newInput("10.10.10.10", false)
+	serverInput.Prompt = ""
+	serverInput.CharLimit = 64
+	serverInput.SetValue(omiai.NormalizeServerHost(cfg.ServerHost))
 
 	m := model{
 		cfg:             cfg,
@@ -213,6 +219,7 @@ func NewModel(cfg Config) tea.Model {
 		loginInputs:     loginInputs,
 		signupInputs:    signupInputs,
 		directInputs:    directInputs,
+		serverInput:     serverInput,
 		dialInput:       dialInput,
 		composer:        composer,
 		viewport:        viewport.New(0, 0),
@@ -275,6 +282,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.session = msg.Session
+		if m.session.ServerHost == "" {
+			m.session.ServerHost = m.cfg.ServerHost
+		}
+		m.applyServerHost(m.session.ServerHost)
 		m.client = msg.Client
 		m.events = msg.Client.Events()
 		m.screen = screenChat
@@ -436,6 +447,12 @@ func (m *model) updateAuth(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	if m.authFocus >= len(inputs) {
+		var cmd tea.Cmd
+		m.serverInput, cmd = m.serverInput.Update(msg)
+		return cmd
+	}
+
 	var cmd tea.Cmd
 	inputs[m.authFocus], cmd = inputs[m.authFocus].Update(msg)
 	m.setCurrentAuthInputs(inputs)
@@ -584,7 +601,8 @@ func (m *model) shiftAuthFocus(delta int) {
 	if len(inputs) == 0 {
 		return
 	}
-	m.authFocus = (m.authFocus + delta + len(inputs)) % len(inputs)
+	total := len(inputs) + 1
+	m.authFocus = (m.authFocus + delta + total) % total
 	m.syncAuthFocus()
 }
 
@@ -597,6 +615,11 @@ func (m *model) syncAuthFocus() {
 			inputs[i].Blur()
 		}
 	}
+	if m.authFocus == len(inputs) {
+		m.serverInput.Focus()
+	} else {
+		m.serverInput.Blur()
+	}
 	m.setCurrentAuthInputs(inputs)
 }
 
@@ -604,6 +627,14 @@ func (m *model) submitAuth() tea.Cmd {
 	m.errorText = ""
 	m.status = ""
 	m.busy = true
+
+	serverHost := strings.TrimSpace(m.serverInput.Value())
+	if err := omiai.ValidateServerHost(serverHost); err != nil {
+		m.busy = false
+		m.errorText = err.Error()
+		return nil
+	}
+	m.applyServerHost(serverHost)
 
 	switch m.authMode {
 	case authModeSignup:
@@ -632,8 +663,9 @@ func (m *model) submitAuth() tea.Cmd {
 		}
 		m.status = "Connecting in direct mode..."
 		session := omiai.Session{
-			DeviceID: store.GenerateDeviceID(),
-			Direct:   true,
+			DeviceID:   store.GenerateDeviceID(),
+			Direct:     true,
+			ServerHost: m.cfg.ServerHost,
 			User: omiai.User{
 				QuicdialID:  quicdialID,
 				DisplayName: quicdialID,
@@ -1089,6 +1121,11 @@ func (m *model) authView() string {
 		form = append(form, m.styles.muted.Render(labels[i]))
 		form = append(form, input.View())
 	}
+	form = append(form, "")
+	form = append(form, m.styles.accent.Render("Connection Settings"))
+	form = append(form, m.styles.muted.Render("Omiai Server IP"))
+	form = append(form, m.serverInput.View())
+	form = append(form, m.styles.subtle.Render("Opal derives http://<ip>:8000 and ws://<ip>:4000/ws/sankaku/websocket automatically."))
 
 	help := m.styles.subtle.Render("left/right switch mode | tab move field | enter submit | q quit")
 
@@ -1124,7 +1161,8 @@ func (m *model) chatView() string {
 	typing := m.renderTypingLine()
 	input := m.renderInput()
 	footer := m.styles.subtle.Render("tab focus | d dial code | enter send/select | f add friend | u remove friend | ctrl+l logout | r reconnect | q quit")
-	base := lipgloss.JoinVertical(lipgloss.Left, header, body, typing, input, footer)
+	connection := m.styles.muted.Render(m.connectionStatusLine())
+	base := lipgloss.JoinVertical(lipgloss.Left, header, body, typing, input, footer, connection)
 	if m.activeDialog != nil {
 		return lipgloss.JoinVertical(lipgloss.Left, base, "", m.renderDialog())
 	}
@@ -1291,13 +1329,41 @@ func (m model) renderTab(label string, active bool) string {
 	return style.Render(label)
 }
 
+func (m *model) applyServerHost(host string) {
+	host = omiai.NormalizeServerHost(host)
+	apiURL, signalingURL := omiai.EndpointsForServerHost(host)
+	m.cfg.ServerHost = host
+	m.cfg.APIURL = apiURL
+	m.cfg.SignalingURL = signalingURL
+	m.cfg.API = omiai.NewAPIClient(apiURL)
+	m.serverInput.SetValue(host)
+}
+
+func (m *model) connectionStatusLine() string {
+	host := m.session.ServerHost
+	if host == "" {
+		host = m.cfg.ServerHost
+	}
+	if host == "" {
+		host = omiai.ServerHostFromEndpoint(m.cfg.SignalingURL)
+	}
+	return fmt.Sprintf("Connected Omiai: %s | %s", host, time.Now().Format("2006-01-02 15:04 MST"))
+}
+
 func connectSessionCmd(cfg Config, session omiai.Session) tea.Cmd {
 	return func() tea.Msg {
+		serverHost := session.ServerHost
+		if serverHost == "" {
+			serverHost = cfg.ServerHost
+		}
+		_, signalingURL := omiai.EndpointsForServerHost(serverHost)
+		session.ServerHost = serverHost
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		client, err := omiai.Dial(ctx, omiai.SocketConfig{
-			SignalingURL: cfg.SignalingURL,
+			SignalingURL: signalingURL,
 			Session:      session,
 		})
 		return connectResultMsg{
@@ -1311,16 +1377,19 @@ func connectSessionCmd(cfg Config, session omiai.Session) tea.Cmd {
 func loginAndConnectCmd(cfg Config, quicdialID, password string) tea.Cmd {
 	return func() tea.Msg {
 		deviceID := store.GenerateDeviceID()
+		serverHost := omiai.NormalizeServerHost(cfg.ServerHost)
+		apiURL, signalingURL := omiai.EndpointsForServerHost(serverHost)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		session, err := cfg.API.Login(ctx, quicdialID, password, deviceID)
+		session, err := omiai.NewAPIClient(apiURL).Login(ctx, quicdialID, password, deviceID)
 		if err != nil {
 			return connectResultMsg{Err: err}
 		}
+		session.ServerHost = serverHost
 
 		client, err := omiai.Dial(ctx, omiai.SocketConfig{
-			SignalingURL: cfg.SignalingURL,
+			SignalingURL: signalingURL,
 			Session:      session,
 		})
 		return connectResultMsg{
@@ -1334,16 +1403,19 @@ func loginAndConnectCmd(cfg Config, quicdialID, password string) tea.Cmd {
 func signupAndConnectCmd(cfg Config, req omiai.SignupRequest) tea.Cmd {
 	return func() tea.Msg {
 		deviceID := store.GenerateDeviceID()
+		serverHost := omiai.NormalizeServerHost(cfg.ServerHost)
+		apiURL, signalingURL := omiai.EndpointsForServerHost(serverHost)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		session, err := cfg.API.Signup(ctx, req, deviceID)
+		session, err := omiai.NewAPIClient(apiURL).Signup(ctx, req, deviceID)
 		if err != nil {
 			return connectResultMsg{Err: err}
 		}
+		session.ServerHost = serverHost
 
 		client, err := omiai.Dial(ctx, omiai.SocketConfig{
-			SignalingURL: cfg.SignalingURL,
+			SignalingURL: signalingURL,
 			Session:      session,
 		})
 		return connectResultMsg{

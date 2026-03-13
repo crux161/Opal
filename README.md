@@ -11,6 +11,7 @@ Opal is a Charm-based TUI peer client for the Omiai signaling stack. It uses:
 This workspace now provides:
 
 - login, signup, and direct-connect flows
+- a connection settings section in auth that accepts a single Omiai server IP and derives the API/websocket endpoints automatically
 - live peer list via `lobby:sankaku`
 - manual quicdial dialing via Omiai's `resolve_quicdial`
 - per-peer chat over `relay_message`
@@ -19,6 +20,7 @@ This workspace now provides:
 - first-contact accept/reject dialogs for non-friends
 - local friend-key persistence plus encrypted follow-up chat and read receipts after trust is established
 - saved JWT session reuse between launches
+- encrypted on-disk session persistence so successful auth reconnects to the same Omiai host
 
 Messages are intentionally server-relayed and ephemeral. This is a basic chat peer, not a durable inbox.
 
@@ -48,7 +50,7 @@ Defaults:
 - API: `http://127.0.0.1:8000`
 - Signal: `ws://127.0.0.1:4000/ws/sankaku/websocket`
 
-Override them if needed:
+Override them if needed from the CLI, or just use the in-app server IP field at login:
 
 ```bash
 go run ./cmd/opal --api-url http://localhost:8000 --signal-url ws://localhost:4000/ws/sankaku/websocket
@@ -71,6 +73,8 @@ go run ./cmd/opal --api-url http://localhost:8000 --signal-url ws://localhost:40
 ## Notes
 
 - Direct mode skips `omiai-api` and authenticates with only a `quicdial_id`, which is useful for local signaling-only testing.
+- The auth screen accepts one Omiai server IP and expands it to `http://<ip>:8000` for the API and `ws://<ip>:4000/ws/sankaku/websocket` for signaling.
 - The websocket client follows the same Phoenix frame shape Gem already uses in `pkg/webrtc_shim`; this keeps Opal aligned with the existing Omiai signaling contract instead of inventing another one.
 - The first message to a non-trusted peer is sent as a friend intro with the sender's public friend key. Once the receiver accepts, both peers can exchange encrypted follow-up messages without another key roundtrip.
 - The dial prompt resolves a quicdial code through Omiai's `resolve_quicdial` event, then injects or focuses that peer in the list so you can message or friend-request them even if they were not already visible in lobby presence.
+- Successful authenticated sessions are stored on disk in encrypted form and include the selected Omiai server host for reconnects.
